@@ -1,0 +1,101 @@
+name: ⚙️ Fine-Tune Gemini (CLI MLOps)
+
+on:
+  # 1. Manual Trigger
+  workflow_dispatch:
+    inputs:
+      dataset_path:
+        description: 'Path to training data file in repo'
+        required: true
+        default: 'data/training.jsonl'
+      epochs:
+        description: 'Number of training epochs (3 recommended)'
+        required: true
+        default: '3'
+      
+permissions:
+  contents: 'read'
+  id-token: 'write' # Required for Workload Identity Federation
+
+jobs:
+  fine-tune:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: ⬇️ Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. Authenticate (Workload Identity Federation)
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: '${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: '${{ secrets.GCP_SERVICE_ACCOUNT }}'
+          token_format: 'access_token'
+
+      # 2. Setup gcloud CLI (Required for storage and project context)
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }} # Use GCP_PROJECT_ID from secrets
+
+      # 3. Upload Data and Submit Job (The Core Logic)
+      - name: '⬆️ Upload Data & Submit Tuning Job'
+        id: submit_job
+        run: |
+          # Variables from Workflow Inputs
+          LOCAL_FILE="${{ inputs.dataset_path }}"
+          EPOCH_COUNT="${{ inputs.epochs }}"
+          
+          # 🚨 Hardcoded Location for your bucket and tuning job 🚨
+          LOCATION="us-central1"
+          
+          # Check if the file exists in the repo
+          if [ ! -f "$LOCAL_FILE" ]; then
+            echo "::error::File not found in the repository: $LOCAL_FILE"
+            exit 1
+          fi
+
+          # --- 3a. Upload Dataset to GCS ---
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          GCS_DATA_URI="gs://${{ secrets.GCP_TRAINING_BUCKET_NAME }}/data/${TIMESTAMP}/$(basename $LOCAL_FILE)"
+          
+          echo "Uploading $LOCAL_FILE to $GCS_DATA_URI..."
+          gcloud storage cp "$LOCAL_FILE" "$GCS_DATA_URI"
+          
+          # --- 3b. Construct and Submit Tuning Job (Fire-and-Forget) ---
+          API_ENDPOINT="https://${LOCATION}-aiplatform.googleapis.com/v1"
+          PROJECT_ID=$(gcloud config get-value project)
+          
+          echo "Submitting job to ${LOCATION}..."
+          
+          # The entire JSON payload is passed to the curl command
+          # Note: We use the access token from the 'auth' step
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ steps.auth.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            "${API_ENDPOINT}/projects/${PROJECT_ID}/locations/${LOCATION}/tuningJobs" \
+            -d '{
+              "baseModel": "gemini-2.0-flash-001",
+              "supervisedTuningSpec": {
+                "training_dataset_uri": "'"${GCS_DATA_URI}"'",
+                "hyper_parameters": {
+                  "epoch_count": '${EPOCH_COUNT}',
+                  "adapter_size": "ADAPTER_SIZE_FOUR"
+                }
+              },
+              "tunedModelDisplayName": "gemini-code-policy-'${TIMESTAMP}'"
+            }')
+          
+          # --- 3c. Parse Response and Output ---
+          TUNING_JOB_ID=$(echo "$RESPONSE" | jq -r '.name' | awk -F/ '{print $NF}')
+          
+          if [ -z "$TUNING_JOB_ID" ] || echo "$RESPONSE" | grep -q "error"; then
+            echo "::error::Failed to submit job. API Response: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "✅ Tuning Job Submitted Successfully!"
+          echo "Job ID: $TUNING_JOB_ID"
+          echo "Monitor status in the Vertex AI Console."
