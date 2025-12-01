@@ -46,7 +46,7 @@ validate_line() {
     local errors=""
 
     # Skip empty lines
-    if [ -z "$line" ] || [ "$line" = "" ]; then
+    if [ -z "$line" ]; then
         return 0
     fi
 
@@ -81,7 +81,18 @@ validate_line() {
             fi
 
             # Validate 'parts' is an array with 'text' field
-            invalid_parts=$(echo "$line" | jq -r '.contents | to_entries[] | .key as $i | .value.parts | if type == "array" then to_entries[] | select(.value.text == null) | "\($i):\(.key)" else "\($i):not_array" end' 2>/dev/null || echo "")
+            # For each content item, check if parts is an array and each part has a text field
+            # Output format: "content_index:part_index" or "content_index:not_array"
+            invalid_parts=$(echo "$line" | jq -r '
+                .contents | to_entries[] |
+                .key as $content_idx |
+                .value.parts |
+                if type == "array" then
+                    to_entries[] | select(.value.text == null) | "\($content_idx):\(.key)"
+                else
+                    "\($content_idx):not_array"
+                end
+            ' 2>/dev/null || echo "")
             if [ -n "$invalid_parts" ]; then
                 for item in $invalid_parts; do
                     if [[ "$item" == *":not_array"* ]]; then
@@ -142,17 +153,18 @@ validate_file() {
         line_num=$((line_num + 1))
         file_lines=$((file_lines + 1))
 
-        # Skip empty lines
-        if [ -z "$(echo "$line" | tr -d '[:space:]')" ]; then
+        # Skip empty or whitespace-only lines
+        if [[ "$line" =~ ^[[:space:]]*$ ]]; then
             continue
         fi
 
-        errors=$(validate_line "$line" "$line_num" "$file")
-        if [ $? -ne 0 ] || [ -n "$errors" ]; then
+        # Validate line and capture errors
+        local validation_errors
+        if ! validation_errors=$(validate_line "$line" "$line_num" "$file") || [ -n "$validation_errors" ]; then
             file_errors=$((file_errors + 1))
             while IFS= read -r error_line; do
                 [ -n "$error_line" ] && print_status "fail" "$error_line"
-            done <<< "$errors"
+            done <<< "$validation_errors"
         fi
     done < "$file"
 
@@ -196,9 +208,13 @@ main() {
         done
     else
         # Find all .jsonl files in the data directory
-        while IFS= read -r -d '' file; do
-            files_to_validate+=("$file")
-        done < <(find "$DATA_DIR" -maxdepth 1 -name "*.jsonl" -type f -print0 2>/dev/null)
+        local found_files
+        found_files=$(find "$DATA_DIR" -maxdepth 1 -name "*.jsonl" -type f 2>/dev/null)
+        if [ -n "$found_files" ]; then
+            while IFS= read -r file; do
+                [ -n "$file" ] && files_to_validate+=("$file")
+            done <<< "$found_files"
+        fi
 
         if [ ${#files_to_validate[@]} -eq 0 ]; then
             print_status "warn" "No .jsonl files found in $DATA_DIR"
